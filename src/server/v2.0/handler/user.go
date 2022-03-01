@@ -196,8 +196,12 @@ func (u *usersAPI) GetCurrentUserInfo(ctx context.Context, params operation.GetC
 		return u.SendError(ctx, errors.PreconditionFailedError(nil).WithMessage("get current user not available for security context: %s", sctx.Name()))
 	}
 	resp, err := u.getUserByID(ctx, lsc.User().UserID)
-	if err != nil {
-
+	if errors.IsNotFoundErr(err) {
+		m := &model.User{
+			User: lsc.User(),
+		}
+		resp = m.ToUserResp()
+	} else if err != nil {
 		return u.SendError(ctx, err)
 	}
 	return operation.NewGetCurrentUserInfoOK().WithPayload(resp)

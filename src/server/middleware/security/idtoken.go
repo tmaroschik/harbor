@@ -15,6 +15,8 @@
 package security
 
 import (
+	"github.com/goharbor/harbor/src/common/models"
+	"github.com/goharbor/harbor/src/lib/errors"
 	"net/http"
 	"strings"
 
@@ -27,6 +29,8 @@ import (
 	"github.com/goharbor/harbor/src/lib/log"
 	"github.com/goharbor/harbor/src/pkg/oidc"
 )
+
+const oidcUserComment = "Temporary onboarded via OIDC token"
 
 type idToken struct{}
 
@@ -43,19 +47,14 @@ func (i *idToken) Generate(req *http.Request) security.Context {
 	if len(token) == 0 {
 		return nil
 	}
-	claims, err := oidc.VerifyToken(ctx, token)
-	if err != nil {
-		log.Warningf("failed to verify token: %v", err)
-		return nil
-	}
-	u, err := user.Ctl.GetBySubIss(ctx, claims.Subject, claims.Issuer)
-	if err != nil {
-		log.Warningf("failed to get user based on token claims: %v", err)
-		return nil
-	}
 	setting, err := config.OIDCSetting(ctx)
 	if err != nil {
 		log.Errorf("failed to get OIDC settings: %v", err)
+		return nil
+	}
+	claims, err := oidc.VerifyToken(ctx, token)
+	if err != nil {
+		log.Warningf("failed to verify token: %v", err)
 		return nil
 	}
 	info, err := oidc.UserInfoFromIDToken(ctx, &oidc.Token{RawIDToken: token}, *setting)
@@ -63,7 +62,44 @@ func (i *idToken) Generate(req *http.Request) security.Context {
 		log.Errorf("Failed to get user info from ID token: %v", err)
 		return nil
 	}
+	u, err := user.Ctl.GetBySubIss(ctx, claims.Subject, claims.Issuer)
+	if setting.AutoOnboard && errors.IsNotFoundErr(err) { // User is not onboarded, kickoff the onboard flow
+		// Recover the username from d.Username by default
+		username := info.Username
+		// Fix blanks in username
+		username = strings.Replace(username, " ", "_", -1)
+		log.Debug("Doing temporary onboarding\n")
+		if username == "" {
+			log.Errorf("unable to recover username for temporary onboard, username claim: %s", setting.UserClaim)
+			return nil
+		}
+		userRec := userOnboardTemporary(info, username)
+		log.Debug("User temporary onboarded\n")
+		u = userRec
+	} else if err != nil {
+		log.Warningf("failed to get user based on token claims: %v", err)
+		return nil
+	}
 	oidc.InjectGroupsToUser(info, u)
 	log.Debugf("an ID token security context generated for request %s %s", req.Method, req.URL.Path)
 	return local.NewSecurityContext(u)
+}
+
+func userOnboardTemporary(info *oidc.UserInfo, username string) *models.User {
+	oidcUser := models.OIDCUser{
+		SubIss: info.Subject + info.Issuer,
+		Secret: "",
+		Token:  "",
+	}
+
+	u := &models.User{
+		Username:     username,
+		Realname:     username,
+		Email:        info.Email,
+		OIDCUserMeta: &oidcUser,
+		Comment:      oidcUserComment,
+	}
+	oidc.InjectGroupsToUser(info, u)
+
+	return u
 }
